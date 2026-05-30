@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--seq-len", type=int, default=1024,
                     help="short context fits 2x A6000; raise if you have room")
     ap.add_argument("--steps", type=int, default=300)
-    ap.add_argument("--lr", type=float, default=0.05, help="LR for the log-scales")
+    ap.add_argument("--lr", type=float, default=0.01, help="LR for the log-scales")
     ap.add_argument("--kl-temperature", type=float, default=1.0)
     ap.add_argument("--out", default="runs/laguna_kv_scales_qad.json")
     ap.add_argument("--log", default="runs/laguna_qad.jsonl")
@@ -90,20 +90,39 @@ def main():
 
     logger = TrainingLogger(args.log, meta={"model": os.path.basename(args.model),
                                             "stage": "scale-only-QAD"})
-    data = iter_token_blocks(args.data, tok, args.seq_len, args.steps, demo=False)
+    data = iter_token_blocks(args.data, tok, args.seq_len, args.steps + 1, demo=False)
+
+    def next_batch():
+        nonlocal data
+        try:
+            return next(data)
+        except StopIteration:
+            data = iter_token_blocks(args.data, tok, args.seq_len, args.steps + 1, demo=False)
+            return next(data)
+
+    # Fixed held-out batch -> an apples-to-apples KL yardstick (per-step train KL
+    # is on different text each step, so it's noisy and NOT a progress signal).
+    eval_ids = next_batch()["input_ids"].to(model.device)
+    with torch.no_grad():
+        eval_teacher = model(input_ids=eval_ids, use_cache=False).logits
+    Vv = eval_teacher.shape[-1]
+    eval_teacher = eval_teacher.reshape(-1, Vv)
+
+    def eval_kl():
+        with torch.no_grad():
+            s = model(input_ids=eval_ids, past_key_values=QADCache(), use_cache=True).logits
+            return float(kl_logit_loss(s.reshape(-1, Vv), eval_teacher,
+                                       temperature=args.kl_temperature))
+
+    init_eval = eval_kl()
+    print(f"  [eval] held-out KL at init (calibrated scales): {init_eval:.5f}")
+    logger.log_eval(0, {"eval_kl": init_eval})
 
     for step in range(args.steps):
-        try:
-            batch = next(data)
-        except StopIteration:
-            data = iter_token_blocks(args.data, tok, args.seq_len, args.steps, demo=False)
-            batch = next(data)
-        ids = batch["input_ids"].to(model.device)
-
+        ids = next_batch()["input_ids"].to(model.device)
         with torch.no_grad():
             t_logits = model(input_ids=ids, use_cache=False).logits
         s_logits = model(input_ids=ids, past_key_values=QADCache(), use_cache=True).logits
-
         V = s_logits.shape[-1]  # per-token-averaged KL
         loss = kl_logit_loss(s_logits.reshape(-1, V), t_logits.reshape(-1, V),
                              temperature=args.kl_temperature)
@@ -113,14 +132,19 @@ def main():
         opt.step()
 
         scales = {f"model.layers.{i}.self_attn": {
-            "k_scale": float(log_k[i].exp()), "v_scale": float(log_v[i].exp()),
+            "k_scale": float(log_k[i].exp().detach()),
+            "v_scale": float(log_v[i].exp().detach()),
             "q_scale": q_fixed[i]} for i in log_k}
-        logger.log_step(step, {"loss": float(loss), "kl": float(loss)},
+        logger.log_step(step, {"loss": float(loss.detach())},
                         scales=scales, lr=args.lr, stage=1)
         if step % 10 == 0 or step == args.steps - 1:
-            print(f"  step {step:4d}  KL={float(loss):.5f}")
+            ek = eval_kl()
+            logger.log_eval(step, {"eval_kl": ek})
+            print(f"  step {step:4d}  train-KL={float(loss.detach()):.5f}  eval-KL={ek:.5f}")
 
     logger.close()
+    print(f"  [eval] held-out KL: init {init_eval:.5f} -> final {eval_kl():.5f}  "
+          f"({'improved' if eval_kl() < init_eval else 'no improvement — calibration was already sufficient'})")
 
     # Export QAD'd scales in the same format as calibration (k/v learned, q kept).
     per_layer = {}
@@ -141,8 +165,18 @@ def main():
                         "steps": args.steps, "seq_len": args.seq_len},
                "per_layer": per_layer, "vllm_keys": vllm_keys}, open(args.out, "w"), indent=2)
     print(f"\nWrote QAD'd scales -> {args.out}")
-    print(f"Plot training:  python -m nvfp4_qad.dashboard {args.log}")
-    print(f"Compare scales: python -m nvfp4_qad.plot_calibration --in {args.out}")
+
+    # Auto-render the training figures so you have them the moment training ends.
+    try:
+        from nvfp4_qad.dashboard import plot_dashboard
+        figs = plot_dashboard(args.log)
+        print("Training figures written:")
+        for p in figs:
+            print(f"  {p}")
+    except Exception as e:  # noqa: BLE001
+        print(f"(figure auto-render skipped: {e}; run "
+              f"`python -m nvfp4_qad.dashboard {args.log}` manually)")
+    print(f"Scale comparison: python -m nvfp4_qad.plot_calibration --in {args.out}")
 
 
 if __name__ == "__main__":
