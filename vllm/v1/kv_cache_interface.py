@@ -46,6 +46,7 @@ class KVQuantMode(IntEnum):
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
     INT4_KIVI = 5  # software INT4 (per-token K+V, head_dim 16-blocks)
+    NVFP4_KIVI = 6  # software NVFP4 (E2M1), KIVI per-channel-K layout
 
     @property
     def is_per_token_head(self) -> bool:
@@ -66,6 +67,10 @@ class KVQuantMode(IntEnum):
         return self == KVQuantMode.INT4_KIVI
 
 
+
+    @property
+    def is_nvfp4_kivi(self) -> bool:
+        return self == KVQuantMode.NVFP4_KIVI
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
     if kv_cache_dtype == "int8_per_token_head":
@@ -74,6 +79,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if kv_cache_dtype == "nvfp4_kivi":
+        return KVQuantMode.NVFP4_KIVI
     if kv_cache_dtype == "int4_kivi":
         return KVQuantMode.INT4_KIVI
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
@@ -177,7 +184,7 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4 or self.kv_quant_mode.is_int4_kivi:
+        if self.kv_quant_mode.is_nvfp4 or self.kv_quant_mode.is_int4_kivi or self.kv_quant_mode.is_nvfp4_kivi:
             # Packed layout: 4-bit data + block scales per head.
             # int4_kivi shares the NVFP4 byte budget (head_size//2 + head_size//16).
             full_dim = nvfp4_kv_cache_full_dim(self.head_size)
@@ -290,7 +297,7 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4 or self.kv_quant_mode.is_int4_kivi:
+        if self.kv_quant_mode.is_nvfp4 or self.kv_quant_mode.is_int4_kivi or self.kv_quant_mode.is_nvfp4_kivi:
             # Packed layout per head: 4-bit data + block scales.
             # data: head_size//2 bytes (2 codes/byte)
             # block scale: head_size//16 bytes (1 scale per 16 elements)
@@ -456,7 +463,7 @@ class SlidingWindowSpec(AttentionSpec):
     @property
     def real_page_size_bytes(self) -> int:
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
-        if self.kv_quant_mode.is_nvfp4 or self.kv_quant_mode.is_int4_kivi:
+        if self.kv_quant_mode.is_nvfp4 or self.kv_quant_mode.is_int4_kivi or self.kv_quant_mode.is_nvfp4_kivi:
             last_dim = nvfp4_kv_cache_full_dim(
                 self.head_size
             ) + nvfp4_kv_cache_full_dim(self.head_size_v)

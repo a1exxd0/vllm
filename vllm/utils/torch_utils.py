@@ -49,6 +49,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_3bit_nc": torch.uint8,
     "nvfp4": torch.uint8,
     "int4_kivi": torch.uint8,
+    "nvfp4_kivi": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -78,7 +79,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
-        or kv_cache_dtype in ("nvfp4", "int4_kivi")
+        or kv_cache_dtype in ("nvfp4", "int4_kivi", "nvfp4_kivi")
     )
 
 

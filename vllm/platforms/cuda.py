@@ -137,6 +137,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
                 AttentionBackendEnum.INT4_KIVI,
+                AttentionBackendEnum.NVFP4_KIVI,
             ]
         else:
             return [
@@ -146,6 +147,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
                 AttentionBackendEnum.INT4_KIVI,
+                AttentionBackendEnum.NVFP4_KIVI,
             ]
 
 
