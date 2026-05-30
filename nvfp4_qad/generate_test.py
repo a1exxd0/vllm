@@ -59,10 +59,13 @@ def make_nvfp4_cache_class(scales):
 
 def generate(model, tok, prompt, max_new, cache=None, chat=True):
     if chat and hasattr(tok, "apply_chat_template") and tok.chat_template:
-        ids = tok.apply_chat_template(
+        enc = tok.apply_chat_template(
             [{"role": "user", "content": prompt}],
             add_generation_prompt=True, return_tensors="pt",
-        ).to(model.device)
+        )
+        # Newer transformers may return a dict/BatchEncoding instead of a tensor.
+        ids = enc["input_ids"] if not torch.is_tensor(enc) else enc
+        ids = ids.to(model.device)
     else:
         ids = tok(prompt, return_tensors="pt").input_ids.to(model.device)
     kw = {}
