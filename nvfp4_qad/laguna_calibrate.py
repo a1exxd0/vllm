@@ -57,11 +57,19 @@ def iter_token_blocks(data_path, tokenizer, seq_len, batches, demo):
                 i += 1
         else:
             while True:  # loop the file if we need more blocks than it holds
+                seen = False
                 with open(data_path, encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line:
+                            seen = True
                             yield json.loads(line).get("text", "")
+                if not seen:
+                    raise RuntimeError(
+                        f"No usable lines in {data_path!r}. Build a corpus first, e.g.:\n"
+                        f"  python -m nvfp4_qad.build_calib_data --from-dir ~/vllm/vllm "
+                        f"--num-docs 3000 --out {data_path}"
+                    )
 
     for txt in source():
         buf += tokenizer(txt).input_ids
@@ -91,7 +99,12 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    try:
+        tok = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True, fix_mistral_regex=True
+        )
+    except TypeError:  # older transformers without the flag
+        tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
     )
