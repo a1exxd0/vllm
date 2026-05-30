@@ -50,6 +50,13 @@ class AmaxAccumulator:
             assert self._max is not None, "AmaxAccumulator received no data"
             return self._max.cpu()
         allv = torch.cat(self._samples)
+        # torch.quantile() rejects tensors above ~2**24 elements; subsample to a
+        # size that still resolves the high quantile well (1M -> ~100 tail samples
+        # at q=0.9999) and is comfortably under the limit.
+        cap = 1_000_000
+        if allv.numel() > cap:
+            idx = torch.randint(0, allv.numel(), (cap,))
+            allv = allv[idx]
         return torch.quantile(allv, self.quantile)
 
 
