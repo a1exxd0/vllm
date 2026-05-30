@@ -92,6 +92,33 @@ vllm serve <qad-checkpoint> --kv-cache-dtype nvfp4   # Blackwell SM100; FlashInf
 # do NOT pass --attention-config.disable_flashinfer_q_quantization (keeps Q in fp8)
 ```
 
+## Figures & live dashboard
+
+Two distinct things — keep them separate when presenting:
+
+- **Method-explainer figures** (`python -m nvfp4_qad.figures` → `figures/fig1_*`, `fig2_*`):
+  exact properties of the NVFP4 codec on synthetic data. They explain *how the
+  quantizer behaves* (the E2M1 staircase; why scale calibration avoids the fp8
+  saturation cliff). They are **not** training results and are watermarked as such.
+
+- **Live training dashboard** (`nvfp4_qad/dashboard.py`): the honest "it's working
+  as I train it" artifact. Your training loop appends one JSONL row per step/eval;
+  the plotter renders real `training_loss.png`, `scale_evolution.png`,
+  `eval_vs_step.png`, `eval_vs_context.png` from *your* run. Wire it via:
+
+  ```python
+  from nvfp4_qad.dashboard import TrainingLogger
+  logger = TrainingLogger("runs/laguna_qad.jsonl", meta={"model": "laguna-xs", "stage": 1})
+  distill_step(batch, ..., cfg=cfg, logger=logger, step=step,
+               scale_names=scale_mods)          # logs losses + per-layer scales
+  logger.log_eval(step, {"ruler_acc": acc}, context_len=131072)
+  ```
+
+  Then, anytime during training:  `python -m nvfp4_qad.dashboard runs/laguna_qad.jsonl`
+
+  Run `python -m nvfp4_qad.dashboard` with no args to render a **watermarked SAMPLE**
+  preview of the layout (synthetic placeholder data — not a result).
+
 ## End-to-end evals
 Run **through vLLM** with `--kv-cache-dtype nvfp4`: RULER (4k→1M), needle-in-haystack
 to 1M, long-doc perplexity, long-repo code completion — compare BF16 teacher /

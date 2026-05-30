@@ -110,12 +110,17 @@ def build_optimizer(student, scale_modules, cfg: QADConfig):
 # --------------------------------------------------------------------------- #
 # One distillation step.
 # --------------------------------------------------------------------------- #
-def distill_step(batch, *, teacher_fn, student_fn, scale_modules, optimizer, cfg: QADConfig):
+def distill_step(batch, *, teacher_fn, student_fn, scale_modules, optimizer, cfg: QADConfig,
+                 logger=None, step: int | None = None, scale_names: dict | None = None):
     """Run one optimization step.
 
     ``teacher_fn(batch) -> (logits, probs_list, hidden_list)`` under no_grad.
     ``student_fn(batch) -> (logits, probs_list, hidden_list)`` with grad.
     Returns a dict of scalar loss components.
+
+    If ``logger`` (a :class:`nvfp4_qad.dashboard.TrainingLogger`) and ``step`` are
+    given, the step is logged.  Pass ``scale_names = {name: module}`` to also log
+    per-layer scales for the scale-evolution figure.
     """
     with torch.no_grad():
         t_logits, t_probs, t_hidden = teacher_fn(batch)
@@ -138,12 +143,18 @@ def distill_step(batch, *, teacher_fn, student_fn, scale_modules, optimizer, cfg
     for m in scale_modules:
         m.clamp_scales()
 
-    return {
+    stats = {
         "loss": float(loss.detach()),
         "kl": float(l_kl.detach()),
         "attn": float(l_attn.detach()) if torch.is_tensor(l_attn) else float(l_attn),
         "hidden": float(l_hidden.detach()),
     }
+    if logger is not None and step is not None:
+        scales = ({name: m.export_scales() for name, m in scale_names.items()}
+                  if scale_names else None)
+        logger.log_step(step, stats, scales=scales, stage=cfg.stage,
+                        lr=optimizer.param_groups[0]["lr"])
+    return stats
 
 
 # --------------------------------------------------------------------------- #
