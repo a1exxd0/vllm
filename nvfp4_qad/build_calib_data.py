@@ -56,9 +56,25 @@ def iter_dir(root, exts, min_chars, max_chars):
 def iter_hf(name, config, split, field, min_chars, max_chars):
     from datasets import load_dataset
 
-    ds = load_dataset(name, config, split=split, streaming=True)
+    def _load(**kw):
+        return load_dataset(name, config, split=split, streaming=True, **kw)
+
+    try:
+        ds = _load()
+    except RuntimeError as e:
+        # datasets v3+ removed loader-script support. Many such datasets have an
+        # auto-converted parquet branch we can read instead.
+        if "scripts are no longer supported" in str(e):
+            print("  [info] legacy loader-script dataset; retrying via the "
+                  "auto-converted parquet branch (refs/convert/parquet)...")
+            ds = _load(revision="refs/convert/parquet")
+        else:
+            raise
+
+    # Common text field names across code/text datasets.
+    candidates = [field, "text", "content", "code", "response", "output", "source"]
     for ex in ds:
-        text = ex.get(field) or ex.get("text") or ex.get("content") or ex.get("code")
+        text = next((ex[c] for c in candidates if c in ex and ex[c]), None)
         if not text or len(text) < min_chars:
             continue
         yield text[:max_chars] if max_chars else text
