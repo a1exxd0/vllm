@@ -3,11 +3,20 @@
 
 Two levels (run what your hardware allows):
 
-  1. ``check_against_reference`` (CPU or any CUDA): asserts the differentiable
-     :func:`nvfp4_qad.fake_quant.fake_quant_kv_nvfp4` forward equals vLLM's own
-     ``ref_nvfp4_quant_dequant`` -- i.e. our STE wrappers don't perturb values.
+  1. ``check_against_reference`` (any hardware): asserts the differentiable
+     :func:`nvfp4_qad.fake_quant.fake_quant_kv_nvfp4` forward equals a CPU
+     reference that reproduces vLLM's ``ref_nvfp4_quant`` math exactly -- i.e.
+     our STE wrappers don't perturb values.  (We inline the CPU reference rather
+     than import vLLM's, because vLLM's reference takes a Triton path on CUDA and
+     Triton's fp8-e4m3 (``fp8e4nv``) does not compile on Ampere/sm_8x.  The math
+     is device-independent, so a CPU reference is the correct equivalence check.)
 
-  2. ``check_against_cuda_kernel`` (Blackwell SM100 only): writes K/V through the
+  2. ``check_device_execution`` (any CUDA): confirms the *pure-PyTorch* fake-quant
+     actually runs on this GPU (e.g. Ampere) and matches the CPU result -- this is
+     what training relies on.  It uses torch fp8 casts, not Triton, so it works on
+     sm_8x where vLLM's Triton reference does not.
+
+  3. ``check_against_cuda_kernel`` (Blackwell SM100 only): writes K/V through the
      real ``reshape_and_cache_flash(..., "nvfp4", k_scale, v_scale)`` kernel,
      dequantizes the packed cache with the fork's own test utility, and compares
      to the fake-quant on identical inputs/scales.  This is the gate that proves
@@ -27,25 +36,83 @@ from nvfp4_qad.fake_quant import (
 )
 
 
+def _cpu_ref_nvfp4_quant_dequant(x: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
+    """CPU reproduction of vLLM ``ref_nvfp4_quant`` + dequant (device-independent).
+
+    Verbatim math from nvfp4_emulation_utils.ref_nvfp4_quant, evaluated on CPU so
+    it never invokes the Triton path (which can't compile fp8-e4m3 on Ampere).
+    """
+    def get_reciprocal(t):
+        return 1.0 / (t + (t == 0) * 1e8)
+
+    def cast_to_fp4(t):
+        sign = torch.sign(t)
+        t = torch.abs(t)
+        t[(t >= 0.0) & (t <= 0.25)] = 0.0
+        t[(t > 0.25) & (t < 0.75)] = 0.5
+        t[(t >= 0.75) & (t <= 1.25)] = 1.0
+        t[(t > 1.25) & (t < 1.75)] = 1.5
+        t[(t >= 1.75) & (t <= 2.5)] = 2.0
+        t[(t > 2.5) & (t < 3.5)] = 3.0
+        t[(t >= 3.5) & (t <= 5.0)] = 4.0
+        t[t > 5.0] = 6.0
+        return t * sign
+
+    bs = NVFP4_BLOCK_SIZE
+    m, n = x.shape
+    gs = global_scale.to(torch.float32).cpu()
+    xb = x.to(torch.float32).cpu().reshape(m, n // bs, bs)
+    vec_max = xb.abs().amax(dim=-1, keepdim=True)
+    scale = gs * (vec_max / 6.0)
+    scale = scale.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float32)
+    output_scale = get_reciprocal(scale * get_reciprocal(gs))
+    scaled = (xb * output_scale).clamp(-6.0, 6.0)
+    fp4 = cast_to_fp4(scaled)
+    dq = (fp4 * (scale / gs)).reshape(m, n)
+    return dq.to(x.dtype)
+
+
 def check_against_reference(
     *, rows: int = 512, head_size: int = 128, dtype=torch.bfloat16, seed: int = 0
 ) -> float:
-    """Compare fake-quant vs vLLM ``ref_nvfp4_quant_dequant``. Returns max abs err."""
-    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-        ref_nvfp4_quant_dequant,
-    )
-
+    """Compare fake-quant vs the CPU reference. Returns max abs err (run on CPU)."""
     g = torch.Generator().manual_seed(seed)
-    x = torch.randn(rows, head_size, dtype=dtype, generator=g)
+    x = torch.randn(rows, head_size, dtype=dtype, generator=g)  # CPU
     k_scale = init_kv_scale_from_amax(x.abs().amax())
     global_scale = (1.0 / k_scale).to(torch.float32).reshape(1)
 
-    ref = ref_nvfp4_quant_dequant(x.clone(), global_scale, NVFP4_BLOCK_SIZE)
+    ref = _cpu_ref_nvfp4_quant_dequant(x.clone(), global_scale)
     mine = fake_quant_kv_nvfp4(x.clone(), k_scale)
 
     err = (ref.float() - mine.float()).abs().max().item()
     print(f"[ref ] head_size={head_size} dtype={dtype} max|ref-fakequant|={err:.3e}")
     return err
+
+
+def check_device_execution(device: str = "cuda", *, head_size: int = 128) -> None:
+    """Confirm the pure-PyTorch fake-quant runs on this GPU and matches CPU.
+
+    Training runs the fake-quant on-device, so this is the check that matters on
+    Ampere (where vLLM's Triton reference can't compile)."""
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[dev ] SKIP: no CUDA device visible")
+        return
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(256, head_size, dtype=torch.bfloat16, generator=g)
+    k_scale = init_kv_scale_from_amax(x.abs().amax())
+    cpu_out = fake_quant_kv_nvfp4(x, k_scale)
+    try:
+        dev_out = fake_quant_kv_nvfp4(x.to(device), k_scale.to(device)).cpu()
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"fake-quant failed to execute on {device}: {e}\n"
+            "If this is a torch fp8 cast issue on this arch, tell the maintainer "
+            "-- a non-fp8-dtype emulation fallback can be added."
+        ) from e
+    err = (dev_out.float() - cpu_out.float()).abs().max().item()
+    assert torch.isfinite(dev_out).all(), "non-finite output on device"
+    name = torch.cuda.get_device_name(0) if device == "cuda" else device
+    print(f"[dev ] fake-quant runs on {name}: max|gpu-cpu|={err:.3e}  OK")
 
 
 def check_gradients(*, head_size: int = 128) -> None:
@@ -145,7 +212,12 @@ def check_against_cuda_kernel(
 
 
 if __name__ == "__main__":
+    # 1. device-independent equivalence (CPU reference) -- works on any hardware.
     for hs in (16, 64, 128, 256):
         check_against_reference(head_size=hs)
+    # 2. gradients reach activations and scales.
     check_gradients()
+    # 3. the pure-PyTorch fake-quant actually runs on this GPU (Ampere included).
+    check_device_execution()
+    # 4. bit-exact match to the real CUDA kernel -- Blackwell SM100 only (else SKIP).
     check_against_cuda_kernel()
