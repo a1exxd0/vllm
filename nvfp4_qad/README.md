@@ -1,8 +1,7 @@
 # nvfp4_qad — Quantization-Aware Distillation for NVFP4 attention
 
-Training-side toolkit to fine-tune a BF16 model (e.g. **Laguna XS**) so its
-attention stays accurate at long (1M) context when served by this vLLM fork with
-`--kv-cache-dtype nvfp4`.
+Training-side toolkit to fine-tune a BF16 model so its attention stays accurate
+at long context when served by this vLLM fork with `--kv-cache-dtype nvfp4`.
 
 ## Why
 
@@ -108,13 +107,13 @@ Two distinct things — keep them separate when presenting:
 
   ```python
   from nvfp4_qad.dashboard import TrainingLogger
-  logger = TrainingLogger("runs/laguna_qad.jsonl", meta={"model": "laguna-xs", "stage": 1})
+  logger = TrainingLogger("runs/nvfp4_qad.jsonl", meta={"model": "my-model", "stage": 1})
   distill_step(batch, ..., cfg=cfg, logger=logger, step=step,
                scale_names=scale_mods)          # logs losses + per-layer scales
   logger.log_eval(step, {"ruler_acc": acc}, context_len=131072)
   ```
 
-  Then, anytime during training:  `python -m nvfp4_qad.dashboard runs/laguna_qad.jsonl`
+  Then, anytime during training:  `python -m nvfp4_qad.dashboard runs/nvfp4_qad.jsonl`
 
   Run `python -m nvfp4_qad.dashboard` with no args to render a **watermarked SAMPLE**
   preview of the layout (synthetic placeholder data — not a result).

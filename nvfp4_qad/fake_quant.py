@@ -34,6 +34,10 @@ NVFP4_BLOCK_SIZE = 16
 FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 
+# Large sentinel used by _safe_reciprocal: 1/(0 + _SAFE_RECIP_EPS) ≈ 0,
+# matching the behaviour of get_reciprocal in nvfp4_emulation_utils.
+_SAFE_RECIP_EPS = 1e8
+
 
 # --------------------------------------------------------------------------- #
 # Scale initialization helpers (see nvfp4_qad.calibration for amax collection).
@@ -48,16 +52,19 @@ FP8_E4M3_MAX = 448.0
 # fp8, so q_scale = amax / 448 too.  Re-confirm with nvfp4_qad.parity if a model
 # has unusually heavy KV outliers (then prefer a high-quantile amax).
 # --------------------------------------------------------------------------- #
-def init_kv_scale_from_amax(amax: torch.Tensor | float) -> torch.Tensor:
-    """Initial per-tensor k_scale / v_scale from an absolute-max estimate."""
+def _scale_from_amax(amax: torch.Tensor | float) -> torch.Tensor:
     amax = torch.as_tensor(amax, dtype=torch.float32)
     return (amax / FP8_E4M3_MAX).clamp_min(torch.finfo(torch.float32).tiny)
+
+
+def init_kv_scale_from_amax(amax: torch.Tensor | float) -> torch.Tensor:
+    """Initial per-tensor k_scale / v_scale from an absolute-max estimate."""
+    return _scale_from_amax(amax)
 
 
 def init_q_scale_from_amax(amax: torch.Tensor | float) -> torch.Tensor:
     """Initial per-tensor q_scale from an absolute-max estimate."""
-    amax = torch.as_tensor(amax, dtype=torch.float32)
-    return (amax / FP8_E4M3_MAX).clamp_min(torch.finfo(torch.float32).tiny)
+    return _scale_from_amax(amax)
 
 
 def kv_global_scale(k_scale: torch.Tensor) -> torch.Tensor:
@@ -126,7 +133,7 @@ def _cast_to_fp4_ste(x: torch.Tensor) -> torch.Tensor:
 
 def _safe_reciprocal(x: torch.Tensor) -> torch.Tensor:
     """``get_reciprocal`` from nvfp4_emulation_utils (0 -> 0, autograd-safe)."""
-    return 1.0 / (x + (x == 0) * 1e8)
+    return 1.0 / (x + (x == 0) * _SAFE_RECIP_EPS)
 
 
 # --------------------------------------------------------------------------- #

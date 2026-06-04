@@ -18,6 +18,10 @@ import torch
 
 from nvfp4_qad.fake_quant import init_kv_scale_from_amax, init_q_scale_from_amax
 
+# Reservoir size for streaming quantile estimation. 1M values gives < 1% error
+# on the 0.9999 quantile for typical activation distributions.
+_RESERVOIR_SIZE = 1_000_000
+
 
 @dataclass
 class AmaxAccumulator:
@@ -26,11 +30,16 @@ class AmaxAccumulator:
     ``quantile=None`` tracks the true max.  A high quantile (e.g. 0.9999) is more
     robust to rare outliers that would otherwise inflate the scale and push the
     bulk of block scales toward fp8 underflow.
+
+    When ``quantile`` is set, values are stored in a fixed-size reservoir sampler
+    (Vitter's Algorithm R) so memory usage is O(_RESERVOIR_SIZE) regardless of
+    how many batches are fed through.
     """
 
     quantile: float | None = None
     _max: torch.Tensor | None = field(default=None, repr=False)
-    _samples: list[torch.Tensor] = field(default_factory=list, repr=False)
+    _reservoir: torch.Tensor | None = field(default=None, repr=False)
+    _reservoir_count: int = field(default=0, repr=False)
 
     def update(self, x: torch.Tensor) -> None:
         x = x.detach().abs().float()
@@ -38,26 +47,36 @@ class AmaxAccumulator:
             m = x.amax()
             self._max = m if self._max is None else torch.maximum(self._max, m)
         else:
-            # Subsample to bound memory; aggregate quantile at the end.
-            flat = x.flatten()
-            if flat.numel() > 1_000_000:
-                idx = torch.randint(0, flat.numel(), (1_000_000,), device=flat.device)
-                flat = flat[idx]
-            self._samples.append(flat.cpu())
+            flat = x.flatten().cpu()
+            n = flat.numel()
+            if self._reservoir is None:
+                self._reservoir = torch.empty(_RESERVOIR_SIZE, dtype=torch.float32)
+            # Fill reservoir up to capacity, then replace randomly (Algorithm R).
+            filled = self._reservoir_count
+            if filled < _RESERVOIR_SIZE:
+                take = min(n, _RESERVOIR_SIZE - filled)
+                self._reservoir[filled:filled + take] = flat[:take]
+                self._reservoir_count += take
+                remaining = flat[take:]
+            else:
+                remaining = flat
+            if remaining.numel() > 0:
+                # For each new element, replace a random reservoir slot.
+                idxs = torch.randint(0, self._reservoir_count + remaining.numel(),
+                                     (remaining.numel(),))
+                mask = idxs < _RESERVOIR_SIZE
+                self._reservoir[idxs[mask]] = remaining[mask]
+                self._reservoir_count += remaining.numel()
 
     def compute(self) -> torch.Tensor:
         if self.quantile is None:
             assert self._max is not None, "AmaxAccumulator received no data"
             return self._max.cpu()
-        allv = torch.cat(self._samples)
-        # torch.quantile() rejects tensors above ~2**24 elements; subsample to a
-        # size that still resolves the high quantile well (1M -> ~100 tail samples
-        # at q=0.9999) and is comfortably under the limit.
-        cap = 1_000_000
-        if allv.numel() > cap:
-            idx = torch.randint(0, allv.numel(), (cap,))
-            allv = allv[idx]
-        return torch.quantile(allv, self.quantile)
+        assert self._reservoir is not None and self._reservoir_count > 0, (
+            "AmaxAccumulator received no data"
+        )
+        valid = self._reservoir[:min(self._reservoir_count, _RESERVOIR_SIZE)]
+        return torch.quantile(valid, self.quantile)
 
 
 @dataclass
@@ -122,11 +141,17 @@ def run_calibration(model, dataloader, accs_handles_setup, *, max_batches: int =
 
     ``accs_handles_setup`` is the ``(accs, handles)`` from
     :func:`attach_calibration_hooks`.  Fake-quant must be *off* during this pass.
+    Hooks are removed before returning so they do not affect subsequent training
+    forwards.
     """
-    accs, _ = accs_handles_setup
+    accs, handles = accs_handles_setup
     model.eval()
-    for i, batch in enumerate(dataloader):
-        if i >= max_batches:
-            break
-        model(**batch)
+    try:
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            model(**batch)
+    finally:
+        for h in handles:
+            h.remove()
     return finalize_scales(accs)

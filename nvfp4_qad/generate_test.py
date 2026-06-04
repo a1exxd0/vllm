@@ -3,20 +3,20 @@
 
 Generates from a prompt twice and prints both side by side:
   * BASELINE  — full bf16 KV cache (what the model normally does).
-  * NVFP4-KV  — the 10 global layers' K/V fake-quantized to NVFP4 using the
-                calibrated scales from Stage-0 (what Blackwell would serve).
+  * NVFP4-KV  — K/V fake-quantized to NVFP4 using the calibrated scales from
+                Stage-0 (what Blackwell would serve).
 
 The NVFP4 path is injected at the KV-cache level (a DynamicCache subclass that
 fake-quantizes post-RoPE K and V on write), so it works with any attention
-backend and needs no model surgery.  This is the PyTorch emulation we validated
+backend and needs no model surgery.  This is the PyTorch emulation validated
 against vLLM's reference (0.0 err) -- not bit-exact to the CUDA kernel (that
 needs Blackwell), but a faithful quality preview.
 
 Note: this emulates NVFP4 **K/V** only; the served path also quantizes Q to fp8,
 which is a smaller effect and not applied here.
 
-    python -m nvfp4_qad.generate_test --model ~/models/Laguna-XS.2 \
-        --scales runs/laguna_kv_scales.json \
+    python -m nvfp4_qad.generate_test --model /path/to/model \
+        --scales runs/kv_scales.json \
         --prompt "Write a Python function that reverses a linked list." \
         --max-new 200
 """
@@ -31,30 +31,39 @@ import torch
 from nvfp4_qad.fake_quant import fake_quant_kv_nvfp4
 
 
-def load_scales(path):
-    d = json.load(open(path, encoding="utf-8"))
+def load_scales(path: str) -> dict[int, tuple[float, float]]:
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
     pl = d["per_layer"]
     return {int(i): (float(v["k_scale"]), float(v["v_scale"])) for i, v in pl.items()}
 
 
-def make_nvfp4_cache_class(scales):
-    """Build a DynamicCache subclass that fake-quantizes K/V for calibrated layers."""
-    from transformers import DynamicCache
+class NVFP4EmuCache:
+    """DynamicCache subclass that fake-quantizes K/V for calibrated layers.
 
-    class NVFP4EmuCache(DynamicCache):
-        def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-            sc = scales.get(layer_idx)
-            if sc is not None:
-                k_scale, v_scale = sc
-                key_states = fake_quant_kv_nvfp4(
-                    key_states, torch.tensor(k_scale, device=key_states.device)
-                ).to(key_states.dtype)
-                value_states = fake_quant_kv_nvfp4(
-                    value_states, torch.tensor(v_scale, device=value_states.device)
-                ).to(value_states.dtype)
-            return super().update(key_states, value_states, layer_idx, cache_kwargs)
+    Args:
+        scales: ``{layer_idx: (k_scale, v_scale)}`` from a calibration JSON.
+    """
 
-    return NVFP4EmuCache
+    def __new__(cls, scales: dict[int, tuple[float, float]]):
+        from transformers import DynamicCache
+
+        class _NVFP4EmuCache(DynamicCache):
+            _scales = scales
+
+            def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+                sc = self._scales.get(layer_idx)
+                if sc is not None:
+                    k_scale, v_scale = sc
+                    key_states = fake_quant_kv_nvfp4(
+                        key_states, torch.tensor(k_scale, device=key_states.device)
+                    ).to(key_states.dtype)
+                    value_states = fake_quant_kv_nvfp4(
+                        value_states, torch.tensor(v_scale, device=value_states.device)
+                    ).to(value_states.dtype)
+                return super().update(key_states, value_states, layer_idx, cache_kwargs)
+
+        return _NVFP4EmuCache()
 
 
 def generate(model, tok, prompt, max_new, cache=None, chat=True):
@@ -63,7 +72,6 @@ def generate(model, tok, prompt, max_new, cache=None, chat=True):
             [{"role": "user", "content": prompt}],
             add_generation_prompt=True, return_tensors="pt",
         )
-        # Newer transformers may return a dict/BatchEncoding instead of a tensor.
         ids = enc["input_ids"] if not torch.is_tensor(enc) else enc
         ids = ids.to(model.device)
     else:
@@ -79,7 +87,7 @@ def generate(model, tok, prompt, max_new, cache=None, chat=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--scales", default="runs/laguna_kv_scales.json")
+    ap.add_argument("--scales", required=True, help="calibration JSON with per_layer k/v scales")
     ap.add_argument("--prompt", default="Write a Python function that reverses a singly linked list.")
     ap.add_argument("--max-new", type=int, default=200)
     ap.add_argument("--no-chat", action="store_true", help="raw prompt, no chat template")
@@ -98,7 +106,6 @@ def main():
     model.eval()
 
     scales = load_scales(args.scales)
-    nvfp4_cache_cls = make_nvfp4_cache_class(scales)
     print(f"Loaded NVFP4-KV scales for {len(scales)} layers: {sorted(scales)}\n")
 
     print("=" * 78)
@@ -109,7 +116,7 @@ def main():
     print("\n--- BASELINE (bf16 KV) ---\n" + base)
 
     nv = generate(model, tok, args.prompt, args.max_new,
-                  cache=nvfp4_cache_cls(), chat=not args.no_chat)
+                  cache=NVFP4EmuCache(scales), chat=not args.no_chat)
     print("\n--- NVFP4-KV (calibrated, emulated) ---\n" + nv)
 
     print("\n" + "=" * 78)

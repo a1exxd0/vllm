@@ -6,7 +6,7 @@ Framework-agnostic scaffold.  You supply:
   * a **student** that is the same model with its attention score computation
     replaced by :class:`nvfp4_qad.attention.NVFP4FakeQuantScores` (one per layer),
   * thin adapters to pull (logits, per-layer attention probs, hidden states) out
-    of each — model-specific; see README for wiring Laguna XS.
+    of each — model-specific; see README for wiring your model.
 
 Stages (advance only as far as the eval gap requires):
   0. Calibrate amax -> init k/v/q_scale            (nvfp4_qad.calibration)
@@ -54,14 +54,19 @@ def kl_logit_loss(student_logits, teacher_logits, *, temperature=1.0):
     return F.kl_div(s_logp, t_p, reduction="batchmean") * (t * t)
 
 
-def attention_map_loss(student_probs, teacher_probs, *, subsample=256):
+def attention_map_loss(
+    student_probs: list[torch.Tensor],
+    teacher_probs: list[torch.Tensor],
+    *,
+    subsample: int = 256,
+) -> torch.Tensor:
     """MSE between student/teacher post-softmax attention maps, per layer.
 
     ``*_probs`` are lists of ``[batch, heads, q, k]`` tensors (one per layer).
     Query positions are subsampled at long context to bound cost.
     """
     if not student_probs:
-        return student_probs.new_zeros(()) if torch.is_tensor(student_probs) else torch.zeros(())
+        return torch.zeros(())
     total = 0.0
     for sp, tp in zip(student_probs, teacher_probs):
         q = sp.shape[-2]

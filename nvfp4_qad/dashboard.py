@@ -8,7 +8,7 @@ presentation figures from that real data.  Nothing here fabricates results.
 Wiring (in your training loop):
 
     from nvfp4_qad.dashboard import TrainingLogger
-    logger = TrainingLogger("runs/laguna_qad.jsonl", meta={"model": "laguna-xs", "stage": 1})
+    logger = TrainingLogger("runs/nvfp4_qad.jsonl", meta={"model": "my-model", "stage": 1})
     ...
     stats = distill_step(batch, ..., cfg=cfg)          # returns {loss, kl, attn, hidden}
     logger.log_step(step, stats,
@@ -19,7 +19,7 @@ Wiring (in your training loop):
 
 Then, anytime (e.g. live during training):
 
-    python -m nvfp4_qad.dashboard runs/laguna_qad.jsonl
+    python -m nvfp4_qad.dashboard runs/nvfp4_qad.jsonl
 
 writes training_loss.png / scale_evolution.png / eval_vs_step.png /
 eval_vs_context.png next to the log.
@@ -227,7 +227,7 @@ def _write_sample(path: str):
     import random
 
     random.seed(0)
-    logger = TrainingLogger(path, meta={"model": "SAMPLE-not-laguna", "stage": 1})
+    logger = TrainingLogger(path, meta={"model": "SAMPLE-placeholder", "stage": 1})
     layers = [f"model.layers.{i}.self_attn" for i in range(4)]
     k0 = {ly: 0.5 * (i + 1) for i, ly in enumerate(layers)}  # start off-target
     for step in range(0, 600, 10):

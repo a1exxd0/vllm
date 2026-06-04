@@ -152,18 +152,20 @@ def check_against_cuda_kernel(
 
     from vllm import _custom_ops as ops
     from vllm.platforms import current_platform
-    from vllm.utils.torch_utils import nvfp4_kv_cache_split_views
+    from vllm.utils.torch_utils import (
+        create_kv_caches_with_random_flash,
+        nvfp4_kv_cache_split_views,
+    )
 
     if not (current_platform.is_cuda() and current_platform.has_device_capability(100)):
         print("[cuda] SKIP: NVFP4 kernel requires Blackwell (SM100). "
               "Run this on the training/serving GPU.")
         return
 
-    from tests.kernels.attention.test_cache import kv_cache_factory_flashinfer
+    # dequant_nvfp4_kv_cache is a stable vLLM test utility for NVFP4 cache dequant.
     from tests.kernels.quantization.nvfp4_utils import dequant_nvfp4_kv_cache
 
     device = "cuda"
-    torch.set_default_device(device)
     num_slots = block_size * num_blocks
     slot_mapping = torch.tensor(
         random.sample(range(num_slots), num_tokens), dtype=torch.long, device=device
@@ -171,7 +173,7 @@ def check_against_cuda_kernel(
     qkv = torch.randn(num_tokens, 3, num_heads, head_size, dtype=dtype, device=device)
     _, key, value = qkv.unbind(dim=1)
 
-    key_caches, value_caches = kv_cache_factory_flashinfer(
+    key_caches, value_caches = create_kv_caches_with_random_flash(
         num_blocks, block_size, 1, num_heads, head_size, "nvfp4", dtype,
         device=device, cache_layout="NHD",
     )

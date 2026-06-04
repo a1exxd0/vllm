@@ -1,0 +1,7 @@
+# Generated figures and sample data — do not commit.
+# Regenerate with:
+#   python -m nvfp4_qad.figures          # method-explainer PNGs
+#   python -m nvfp4_qad.dashboard        # sample layout preview (writes _sample_run.jsonl)
+#   python -m nvfp4_qad.dashboard <log>  # real training figures from your run
+*.png
+*.jsonl

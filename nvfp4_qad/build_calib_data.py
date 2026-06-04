@@ -6,8 +6,8 @@ Two modes:
                     Best default: calibrate on code representative of your traffic.
   --from-hf NAME    stream a Hugging Face dataset (e.g. a code dataset).
 
-The calibrator (nvfp4_qad.laguna_calibrate) packs these texts into fixed-length
-blocks itself, so each line here can just be one file/document.
+The calibration loop (``nvfp4_qad.train`` or your own) packs these texts into
+fixed-length blocks; each line here is one file/document.
 
 Examples:
     # from a local code tree (e.g. the vllm repo, or your own codebase):
@@ -128,8 +128,7 @@ def main():
     else:
         print(f"  At seq-len 4096 that's ~{int(approx_tok/4096)} packed blocks "
               f"(plenty for --batches 64).")
-        print(f"Next:\n  python -m nvfp4_qad.laguna_calibrate --model ~/models/Laguna-XS.2 "
-              f"--data {args.out} --seq-len 4096 --batches 64 --out runs/laguna_kv_scales.json")
+        print(f"Next: run your model's calibration script with --data {args.out}")
 
 
 if __name__ == "__main__":

@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Entry point for NVFP4 attention QAD.
+"""Abstract base class and entry point for NVFP4 attention QAD.
 
-Runs: Stage-0 calibration -> staged QAD distillation -> export scales, with live
-dashboard logging.  The ONE model-specific piece you must implement is
-``build_adapters`` (≈30 lines): how to read post-RoPE Q/K/V from Laguna's
-attention, and how to run teacher (BF16) vs student (fake-quant) forwards.
+Subclass :class:`QADTrainer` and implement :meth:`build_adapters` to wire the
+toolkit to your model's attention mechanism.  See ``README.md`` for the expected
+adapter contract.
 
-Usage (on your Blackwell GPU):
+Usage (after implementing build_adapters in your subclass):
     # 0. verify the codec matches the CUDA kernel first (no training):
     python -m nvfp4_qad.parity
 
     # 1. then train:
     python -m nvfp4_qad.train \
-        --model /path/to/laguna-xs --data /path/to/longctx.jsonl \
+        --model /path/to/model --data /path/to/longctx.jsonl \
         --stage 1 --steps 2000 --seq-len 8192 \
-        --out runs/laguna_qad --log runs/laguna_qad.jsonl
+        --out runs/nvfp4_qad --log runs/nvfp4_qad.jsonl
 
     # 2. watch it live (separate shell, re-run anytime):
-    python -m nvfp4_qad.dashboard runs/laguna_qad.jsonl
+    python -m nvfp4_qad.dashboard runs/nvfp4_qad.jsonl
 """
 
 from __future__ import annotations
@@ -25,25 +24,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from abc import ABC, abstractmethod
 
 
-def build_adapters(model, head_dim):
-    """YOU IMPLEMENT THIS for Laguna XS.  Return a dict with:
+class QADTrainer(ABC):
+    """Abstract base for model-specific NVFP4 QAD wiring.
 
-        named_attn_modules : {name: attention_module}      (for calibration hooks)
-        get_qkv(module, inputs, output) -> (q, k, v)       (post-RoPE Q/K, V; [B,H,S,D])
-        install_student(scale_mods: {name: NVFP4FakeQuantScores})
-            -> monkeypatch each attention to route scores through its scale module
-        teacher_fn(batch) -> (logits, probs_list, hidden_list)   # BF16, no grad
-        student_fn(batch) -> (logits, probs_list, hidden_list)   # fake-quant attn
-
-    See README "You must wire".  Q/K must be taken AFTER RoPE (vLLM caches
-    post-RoPE K), softmax_scale = head_dim**-0.5.
+    Subclass this and implement :meth:`build_adapters` for your architecture.
     """
-    raise NotImplementedError(
-        "Wire build_adapters() to Laguna's attention (see docstring + README). "
-        "Until then, run `python -m nvfp4_qad.parity` to validate the codec on GPU."
-    )
+
+    @abstractmethod
+    def build_adapters(self, model, head_dim: int) -> dict:
+        """Return a dict with the following keys:
+
+            named_attn_modules : {name: attention_module}      (for calibration hooks)
+            get_qkv(module, inputs, output) -> (q, k, v)       (post-RoPE Q/K, V; [B,H,S,D])
+            install_student(scale_mods: {name: NVFP4FakeQuantScores})
+                -> monkeypatch each attention to route scores through its scale module
+            teacher_fn(batch) -> (logits, probs_list, hidden_list)   # BF16, no grad
+            student_fn(batch) -> (logits, probs_list, hidden_list)   # fake-quant attn
+
+        Q/K must be taken AFTER RoPE (vLLM caches post-RoPE K).
+        ``softmax_scale`` should be ``head_dim**-0.5``.
+        """
 
 
 def load_jsonl(path, tokenizer, seq_len, batch_size):
@@ -52,7 +55,8 @@ def load_jsonl(path, tokenizer, seq_len, batch_size):
     buf = []
     with open(path, encoding="utf-8") as f:
         for line in f:
-            txt = json.loads(line).get("text", "")
+            obj = json.loads(line)
+            txt = obj.get("text", "")
             buf += tokenizer(txt).input_ids
             while len(buf) >= seq_len * batch_size:
                 ids = torch.tensor(buf[: seq_len * batch_size]).view(batch_size, seq_len)
@@ -91,22 +95,21 @@ def main():
         args.model, torch_dtype=torch.bfloat16, device_map="cuda"
     )
     head_dim = model.config.hidden_size // model.config.num_attention_heads
-    ad = build_adapters(model, head_dim)
+
+    # Instantiate the model-specific trainer subclass.  Users must implement
+    # build_adapters() — see class QADTrainer above and README for guidance.
+    trainer = _get_trainer_impl()
+    ad = trainer.build_adapters(model, head_dim)
 
     # --- Stage 0: calibrate amax -> initial scales -------------------------- #
     print("[stage0] calibrating amax(Q/K/V)...")
     accs, handles = attach_calibration_hooks(
         ad["named_attn_modules"], get_qkv=ad["get_qkv"], quantile=0.9999
     )
-    model.eval()
-    with torch.no_grad():
-        for i, batch in enumerate(load_jsonl(args.data, tok, args.seq_len, args.batch_size)):
-            if i >= args.calib_batches:
-                break
-            model(**batch)
-    for h in handles:
-        h.remove()
-    scales0 = finalize_scales(accs)
+    scales0 = finalize_scales(
+        run_calibration_loop(model, load_jsonl(args.data, tok, args.seq_len, args.batch_size),
+                             (accs, handles), max_batches=args.calib_batches)
+    )
 
     scale_mods = {
         name: NVFP4FakeQuantScores(
@@ -139,6 +142,28 @@ def main():
     log.close()
     print(f"[done] exported {len(out_scales)} scale entries to {args.out}/kv_scales.json")
     print("Serve:  vllm serve <checkpoint-with-these-scales> --kv-cache-dtype nvfp4")
+
+
+def run_calibration_loop(model, data_iter, accs_handles_setup, *, max_batches):
+    """Run calibration data through the model and return raw accumulators.
+
+    Hook removal is handled by :func:`nvfp4_qad.calibration.run_calibration`.
+    """
+    from nvfp4_qad.calibration import run_calibration
+    return run_calibration(model, data_iter, accs_handles_setup, max_batches=max_batches)
+
+
+def _get_trainer_impl() -> QADTrainer:
+    """Return the QADTrainer subclass to use.
+
+    Override this in your entry point, or subclass QADTrainer and call
+    main() after setting this to return your instance.
+    """
+    raise NotImplementedError(
+        "No QADTrainer implementation found.  Subclass QADTrainer, implement "
+        "build_adapters(), and call main() from your entry point.  "
+        "See README for an example."
+    )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,12 @@ import torch.nn.functional as F
 from nvfp4_qad.fake_quant import fake_quant_kv_nvfp4, fake_quant_q_fp8
 
 
+def _to_log_scale(x: float | torch.Tensor) -> torch.Tensor:
+    """Convert a positive scale value to log space for parameterisation."""
+    tiny = torch.finfo(torch.float32).tiny
+    return torch.as_tensor(x, dtype=torch.float32).clamp_min(tiny).log()
+
+
 def nvfp4_fake_quant_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -41,12 +47,20 @@ def nvfp4_fake_quant_attention(
     attn_mask: torch.Tensor | None = None,
     quantize_q: bool = True,
     return_probs: bool = False,
+    subsample_q: int | None = None,
 ):
     """Run attention with NVFP4 K/V + FP8 Q fake-quant.
 
     Q/K/V are ``[batch, heads, seq, head_dim]`` (post-RoPE for Q/K).  Returns the
     attention output, and optionally the post-softmax probabilities (for the
     attention-map distillation loss).
+
+    Args:
+        subsample_q: if given, restrict the attention map computation to this many
+            randomly-selected query positions.  Only applies when
+            ``return_probs=True``; has no effect otherwise.  Use this to bound
+            memory at long context — the QK^T matrix is ``O(subsample_q * seq)``
+            instead of ``O(seq^2)``.
     """
     qd = fake_quant_q_fp8(q, q_scale) if quantize_q else q
     kd = fake_quant_kv_nvfp4(k, k_scale)
@@ -60,18 +74,44 @@ def nvfp4_fake_quant_attention(
         return out, None
 
     # Explicit path so we can hand back the softmax map for distillation.
+    # Subsample query positions BEFORE computing QK^T to bound memory at long ctx.
     scale = softmax_scale if softmax_scale is not None else qd.shape[-1] ** -0.5
-    logits = torch.matmul(qd, kd.transpose(-1, -2)) * scale
-    if attn_mask is not None:
-        logits = logits + attn_mask
-    elif is_causal:
+    seq = qd.shape[-2]
+
+    if subsample_q is not None and subsample_q < seq:
+        idx = torch.randperm(seq, device=qd.device)[:subsample_q]
+        qd_sub = qd[..., idx, :]
+        mask_sub = attn_mask[..., idx, :] if attn_mask is not None else None
+        causal_mask_sub = None
+        if is_causal and mask_sub is None:
+            full_pos = idx.unsqueeze(1)
+            k_pos = torch.arange(seq, device=qd.device).unsqueeze(0)
+            causal_mask_sub = k_pos > full_pos  # True where masked
+    else:
+        idx = None
+        qd_sub = qd
+        mask_sub = attn_mask
+        causal_mask_sub = None
+
+    logits = torch.matmul(qd_sub, kd.transpose(-1, -2)) * scale
+    if mask_sub is not None:
+        logits = logits + mask_sub
+    elif causal_mask_sub is not None:
+        logits = logits.masked_fill(causal_mask_sub.unsqueeze(0).unsqueeze(0), float("-inf"))
+    elif is_causal and idx is None:
         s = logits.shape[-1]
         causal = torch.triu(
             torch.ones(s, s, dtype=torch.bool, device=logits.device), diagonal=1
         )
         logits = logits.masked_fill(causal, float("-inf"))
     probs = logits.softmax(dim=-1)
-    out = torch.matmul(probs, vd)
+    out_sub = torch.matmul(probs, vd)
+
+    if idx is not None:
+        out = torch.zeros_like(qd)
+        out[..., idx, :] = out_sub
+    else:
+        out = out_sub
     return out, probs
 
 
@@ -99,11 +139,9 @@ class NVFP4FakeQuantScores(nn.Module):
         quantize_q: bool = True,
     ):
         super().__init__()
-        tiny = torch.finfo(torch.float32).tiny
-        to_log = lambda x: torch.as_tensor(x, dtype=torch.float32).clamp_min(tiny).log()
-        self.log_k_scale = nn.Parameter(to_log(k_scale_init))
-        self.log_v_scale = nn.Parameter(to_log(v_scale_init))
-        self.log_q_scale = nn.Parameter(to_log(q_scale_init))
+        self.log_k_scale = nn.Parameter(_to_log_scale(k_scale_init))
+        self.log_v_scale = nn.Parameter(_to_log_scale(v_scale_init))
+        self.log_q_scale = nn.Parameter(_to_log_scale(q_scale_init))
         self.softmax_scale = softmax_scale
         self.quantize_q = quantize_q
 
@@ -134,7 +172,8 @@ class NVFP4FakeQuantScores(nn.Module):
         for p in self.scale_parameters():
             p.clamp_(min=-30.0, max=30.0)
 
-    def forward(self, q, k, v, *, is_causal=True, attn_mask=None, return_probs=False):
+    def forward(self, q, k, v, *, is_causal=True, attn_mask=None, return_probs=False,
+                subsample_q=None):
         return nvfp4_fake_quant_attention(
             q, k, v,
             self.k_scale, self.v_scale, self.q_scale,
@@ -143,12 +182,18 @@ class NVFP4FakeQuantScores(nn.Module):
             attn_mask=attn_mask,
             quantize_q=self.quantize_q,
             return_probs=return_probs,
+            subsample_q=subsample_q,
         )
 
     def export_scales(self) -> dict[str, float]:
         """Per-tensor positive scalars for the vLLM checkpoint (k/v/q_scale)."""
-        return {
-            "k_scale": float(self.k_scale.detach().clamp_min(0).item()),
-            "v_scale": float(self.v_scale.detach().clamp_min(0).item()),
-            "q_scale": float(self.q_scale.detach().clamp_min(0).item()),
-        }
+        result = {}
+        for name, scale in (("k_scale", self.k_scale), ("v_scale", self.v_scale),
+                             ("q_scale", self.q_scale)):
+            val = float(scale.detach().item())
+            assert val > 0.0, (
+                f"{name}={val} must be > 0; vLLM silently defaults to 1.0 for "
+                "missing/non-positive scales"
+            )
+            result[name] = val
+        return result
